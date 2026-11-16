@@ -1,0 +1,142 @@
+"""Run the whole project end to end.
+
+    python run_pipeline.py            # full run (about 15 minutes)
+    python run_pipeline.py --skip-db  # reuse the database and backtest from a previous run
+
+Steps
+  1. Download the raw data and build data/retail.db (SQL cleaning + weekly totals)
+  2. ABC classification and choice of products to forecast
+  3. Rolling backtest of five forecasting models
+  4. Stock simulation: which forecast gives the best service for the least stock
+  5. Reorder plan for the weeks after the data ends
+  6. Write CSV files for Power BI, charts and a results summary
+"""
+import argparse
+import sqlite3
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from rdf import backtest, config, data, inventory, plots, segment  # noqa: E402
+
+
+def main(skip_db: bool = False) -> None:
+    config.OUTPUT_DIR.mkdir(exist_ok=True)
+    config.FIGURE_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 1. Data
+    if skip_db and config.DB_PATH.exists():
+        con = sqlite3.connect(config.DB_PATH)
+    else:
+        data.download_raw()
+        print("Building database ...")
+        con = data.build_database()
+    cleaning = data.cleaning_summary(con)
+    weekly = data.load_weekly(con)
+
+    # 2. Which products
+    abc = segment.abc_classes(weekly, config.LAST_FULL_WEEK)
+    skus = segment.select_products(abc)
+    abc["forecasted"] = abc.sku.isin(skus)
+    weekly = segment.cap_outliers(weekly, config.OUTLIER_FIT_UNTIL)
+    print(f"{len(skus)} products selected for forecasting")
+
+    # 3. Backtest
+    cache = config.ROOT / "data" / "backtest_results.pkl"
+    if skip_db and cache.exists():
+        results = pd.read_pickle(cache)
+    else:
+        print("Running backtest ...")
+        results = backtest.run_backtest(weekly, skus)
+        results.to_pickle(cache)
+    acc = backtest.score(results)
+    acc_h = backtest.score(results, by=("model", "horizon"))
+    classes = abc.set_index("sku").abc_class
+    acc_abc = backtest.score(results.assign(abc_class=results.sku.map(classes)),
+                             by=("model", "abc_class"))
+    acc_lt = backtest.score_lead_time(results, inventory.PROTECTION_WEEKS)
+    best = acc.sort_values("wape").iloc[0].model
+    print(acc.round(3).to_string(index=False))
+
+    # 4. Stock simulation
+    print("Simulating stock policies ...")
+    panel = backtest.make_panel(weekly, skus)
+    sim_input = results[results.cutoff >= config.SIMULATION_START]
+    history = results  # error history for safety stock includes the warm-up weeks
+    sims = []
+    for model in sorted(results.model.unique()):
+        sim = inventory.simulate(history[history.model == model], model, abc, panel,
+                                 cutoffs=sorted(sim_input.cutoff.unique()))
+        sims.append(sim)
+    sim = pd.concat(sims, ignore_index=True)
+    sim_summary = inventory.simulation_summary(sim)
+    print(sim_summary.round(3).to_string(index=False))
+
+    # 5. Reorder plan after the data ends, using the most accurate model
+    future = backtest.forecast_future(weekly, skus, best, config.LAST_FULL_WEEK)
+    plan = inventory.reorder_plan(future, results[results.model == best], abc, weekly,
+                                  pd.Timestamp(config.LAST_FULL_WEEK))
+
+    # 6. Outputs
+    out = config.OUTPUT_DIR
+    names = weekly[["sku", "description"]].drop_duplicates("sku")
+    abc.merge(names, on="sku", how="left").to_csv(out / "products.csv", index=False)
+    (weekly.groupby("week_start")[["units", "revenue"]].sum().reset_index()
+     .to_csv(out / "weekly_total.csv", index=False))
+    (weekly[weekly.sku.isin(skus)][["sku", "week_start", "units", "units_capped", "revenue"]]
+     .to_csv(out / "weekly_demand.csv", index=False))
+    (results[results.horizon == 1].round({"forecast": 2})
+     .to_csv(out / "backtest_forecasts_1week.csv", index=False))
+    acc.to_csv(out / "accuracy_by_model.csv", index=False)
+    acc_h.to_csv(out / "accuracy_by_horizon.csv", index=False)
+    acc_abc.to_csv(out / "accuracy_by_class.csv", index=False)
+    acc_lt.to_csv(out / "accuracy_lead_time.csv", index=False)
+    sim_summary.to_csv(out / "simulation_summary.csv", index=False)
+    (sim.groupby(["model", "week_start"])[["demand", "sold", "lost", "end_stock"]].sum()
+     .reset_index().to_csv(out / "simulation_weekly.csv", index=False))
+    plan.to_csv(out / "reorder_plan.csv", index=False)
+    cleaning.to_csv(out / "cleaning_steps.csv", index=False)
+
+    plots.make_all(weekly, results, acc, acc_h, sim_summary, best)
+    write_results(cleaning, abc, skus, acc, acc_lt, acc_abc, sim_summary, best, plan)
+    print("Done. See outputs/ and reports/.")
+
+
+def write_results(cleaning, abc, skus, acc, acc_lt, acc_abc, sim_summary, best, plan):
+    def table(df):
+        return df.to_markdown(index=False, floatfmt=".3f")
+    sel = abc[abc.sku.isin(skus)]
+    text = f"""# Results (generated by run_pipeline.py)
+
+## Data cleaning
+{cleaning.to_markdown(index=False)}
+
+## Products forecast
+{len(skus)} products ({(sel.abc_class == 'A').sum()} A-class, {(sel.abc_class == 'B').sum()} B-class),
+{sel.revenue_52w.sum() / abc.revenue_52w.sum():.1%} of revenue in the last 52 weeks.
+
+## Forecast accuracy, weekly (all cutoffs, horizons 1-{config.HORIZON_WEEKS})
+{table(acc)}
+
+## Forecast accuracy, total demand over the next {inventory.PROTECTION_WEEKS} weeks
+{table(acc_lt)}
+
+## Accuracy by ABC class
+{table(acc_abc)}
+
+## Stock simulation (from {config.SIMULATION_START}, lead time {config.LEAD_TIME_WEEKS} weeks)
+{table(sim_summary)}
+
+Most accurate model: **{best}**. Reorder plan rows: {len(plan)}.
+"""
+    (config.ROOT / "reports" / "results.md").write_text(text, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--skip-db", action="store_true",
+                        help="reuse data/retail.db and the saved backtest instead of rebuilding them")
+    main(parser.parse_args().skip_db)

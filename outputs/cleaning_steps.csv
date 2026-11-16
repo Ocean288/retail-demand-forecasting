@@ -1,0 +1,7 @@
+step,lines_remaining
+All invoice lines,1044847
+Remove cancellation invoices,1025682
+Remove returns / negative quantities,1022289
+Remove zero-price lines,1019653
+Keep real product codes only,1014945
+Remove orders later cancelled in full,1005542
