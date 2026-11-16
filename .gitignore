@@ -1,0 +1,10 @@
+# Raw data and the local database are rebuilt by the pipeline
+data/raw/
+data/*.db
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+*.pbix.bak
